@@ -1,0 +1,12 @@
+.ipynb_checkpoints
+/__pycache__
+/temp
+*.fits
+*.pk
+*.dat
+*.pkl
+*.DS_Store
+*.err
+*.out
+/Notebooks
+*.ipynb
