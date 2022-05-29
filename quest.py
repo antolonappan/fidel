@@ -3,7 +3,7 @@ import basic
 import curvedsky as cs
 import cmb
 import numpy as np
-from utils import camb_clfile,timing,hash_array
+from utils import camb_clfile,timing,hash_array,Dic2Cls
 import os
 import mpi
 import pickle as pl
@@ -17,14 +17,15 @@ import analysis as ana
 class RecoBase:
 
     def __init__(self,lib_dir,fwhm,nside,nlev_p,maskpath,
-                      len_cl_file,unl_cl_file,
+                      len_cl_file,unl_cl_file,lmax,
                       cmb_sim_dir=None,cmb_sim_prefix=None,
                       exp_sim_dir=None,exp_sim_prefix=None,
                       phi_sim_dir=None,phi_sim_prefix=None,
                       FG=False,
                       Lmax=1024,
                       nbin=100,
-                      ana_lmax = 1024
+                      ana_lmax = 1024,
+                      whichFG=None,fg_param=None
                 ):
 
         if FG:
@@ -34,20 +35,22 @@ class RecoBase:
 
         self.lib_dir = lib_dir
         self.mass_dir = os.path.join(lib_dir,'MASS')
+        self.map_dir = os.path.join(lib_dir, 'MAP')
         if mpi.rank == 0:
             os.makedirs(self.mass_dir, exist_ok=True)
+            os.makedirs(self.map_dir, exist_ok=True)
         mpi.barrier()
 
         self.fwhm = fwhm
-        self.nside = nside         
+        self.nside = nside
         self.Tcmb  = 2.726e6
-        self.lmax  = 2*nside     
+        self.lmax  = lmax
         self.npix  = 12*nside**2
         self.l = np.linspace(0,self.lmax,self.lmax+1)
-        self.sigma = nlev_p      
+        self.sigma = nlev_p
         self.Nl = (self.sigma*(np.pi/10800.)/self.Tcmb)**2 * np.ones(self.lmax+1)
         self.Lmax  = Lmax
-        self.rlmin, self.rlmax = 200, 1024 
+        self.rlmin, self.rlmax = 300, 3000
         self.L = np.linspace(0,self.Lmax,self.Lmax+1)
         self.mask = hp.ud_grade(hp.read_map(maskpath),self.nside)
         self.fsky = np.mean(self.mask)
@@ -64,6 +67,8 @@ class RecoBase:
         self.phi_sim_dir = phi_sim_dir
         self.phi_sim_pre = phi_sim_prefix
         self.FG = FG
+        self.whichFG = whichFG
+        self.fg_param = fg_param
         self.nbin = nbin
         self.mb = binning.multipole_binning(self.nbin,lmin=2,lmax=ana_lmax)
         self.B = self.mb.bc
@@ -76,6 +81,7 @@ class RecoBase:
         mc = config['Map']
         rc = config['Reconstruction']
         ac = config['Analysis']
+        fgc = config['FG']
 
         lib_dir = fc['lib_dir']
         cmb_sim_dir = None if len(fc['cmb_dir']) == 0 else fc['cmb_dir']
@@ -91,7 +97,11 @@ class RecoBase:
         maskpath = mc['maskpath']
         len_cl_file = cc['cl_len']
         unl_cl_file = cc['cl_unl']
-        FG = bool(mc['FG'])
+        FG = bool(fgc['FG'])
+        lmax = int(mc['lmax'])
+        
+        whichFG = fgc['which']
+        fg_param = fgc['param']
 
         Lmax = rc['Lmax']
 
@@ -99,10 +109,10 @@ class RecoBase:
         nbin = ac['nbin']
 
         return cls(lib_dir,fwhm,nside,nlev_p,maskpath,
-                   len_cl_file,unl_cl_file,cmb_sim_dir,
+                   len_cl_file,unl_cl_file,lmax,cmb_sim_dir,
                    cmb_sim_prefix,exp_sim_dir,exp_sim_prefix,
                    phi_sim_dir,phi_sim_prefix,
-                   FG,Lmax,nbin,ana_lmax)
+                   FG,Lmax,nbin,ana_lmax,whichFG,fg_param)
 
 
 
@@ -131,30 +141,86 @@ class RecoBase:
         del Ac
         return Ag
 
-    def get_cmb_sim(self,idx):
+    def get_cmb_alm(self,idx):
         fname = os.path.join(self.cmb_sim_dir,f"{self.cmb_sim_pre}{idx:04d}.fits")
-        return hp.map2alm(hp.read_map(fname,(0,1,2)),lmax=self.lmax)
+        return hp.map2alm(self.get_cmb_map(idx),lmax=self.lmax)
 
-    def make_exp_sim(self,idx):
-        Tlm, Elm, Blm = self.get_cmb_sim(idx)
-        Tlm_f = hp.almxfl(Tlm/self.Tcmb,self.beam) + hp.synalm(self.Nl,lmax=self.lmax)
-        Elm_f = hp.almxfl(Elm/self.Tcmb,self.beam)+ hp.synalm(self.Nl,lmax=self.lmax)
-        Blm_f = hp.almxfl(Blm/self.Tcmb,self.beam) + hp.synalm(self.Nl,lmax=self.lmax)
-        del (Tlm, Elm, Blm)
-        T,Q,U = hp.alm2map([Tlm_f,Elm_f,Blm_f],self.nside)
-        del T
+    def get_cmb_map(self,idx):
+        fname = os.path.join(self.cmb_sim_dir,f"{self.cmb_sim_pre}{idx:04d}.fits")
+        return hp.ud_grade(hp.read_map(fname,(0,1,2)),self.nside)/self.Tcmb
+
+    def get_sim_noFG(self,idx):
+        Qfname = os.path.join(self.map_dir,f'exp_sim_Q_{idx:04d}.fits')
+        Ufname = os.path.join(self.map_dir,f'exp_sim_U_{idx:04d}.fits')
+        if os.path.isfile(Qfname) and os.path.isfile(Ufname):
+            Q = hp.read_map(Qfname)
+            U = hp.read_map(Ufname)
+        else:
+            Tlm, Elm, Blm = self.get_cmb_alm(idx)
+            Tlm_f = hp.almxfl(Tlm,self.beam) + hp.synalm(self.Nl,lmax=self.lmax)
+            Elm_f = hp.almxfl(Elm,self.beam)+ hp.synalm(self.Nl,lmax=self.lmax)
+            Blm_f = hp.almxfl(Blm,self.beam) + hp.synalm(self.Nl,lmax=self.lmax)
+            del (Tlm, Elm, Blm)
+            T,Q,U = hp.alm2map([Tlm_f,Elm_f,Blm_f],self.nside)
+            del T
+            hp.write_map(Qfname,Q)
+            hp.write_map(Ufname,U)
         return np.reshape(np.array((Q*self.mask,U*self.mask)),(2,1,self.npix))
 
-    def get_exp_sim(self,idx):
-        fname = os.path.join(self.exp_sim_dir,f"{self.exp_sim_pre}{idx:04d}.fits")
-        Tlm,Elm,Blm = hp.map2alm(hp.read_map(fname,(0,1,2)),lmax=self.lmax)
-        T,Q,U = hp.alm2map([Tlm_f,Elm_f,Blm_f],self.nside)
-        del (Tlm,Elm,Blm,T)
+    @property
+    def gaussian_dust_spectra(self):
+        l = self.l
+        dl = l*(l+1)/(2*np.pi)
+        spectra = lambda a,b: (0.0417)**2 * (a * (l/80)**-b)/dl /self.Tcmb**2
+        spectra_param = Dic2Cls(pl.load(open(self.fg_param,'rb')))
+        amp = spectra_param.Amp
+        beta = spectra_param.beta
+        spectra_cl = np.array([spectra(ai,bi) for ai,bi in zip(amp,beta)])
+        for i in range(3):
+            spectra_cl[i][0] = 0
+        return spectra_cl
+    @property
+    def gaussian_dust_map(self):
+        t,e,b = self.gaussian_dust_spectra
+        return hp.syfast([t,e,b,t*0],self.nside)
+
+    def get_sim_FG(self,idx):
+        # Foreground part
+        if self.whichFG == 'G':
+            assert self.fg_param is not None
+            t, Q_dust, U_dust = self.gaussian_dust_map
+            del t
+
+        elif self.whichFG == 'NG':
+            #assert self.fg_file is not None
+            raise NotImplementionError
+        else:
+            raise ValueError
+        #CMB part
+        T, Q_cmb, U_cmb = self.get_cmb_map(idx)
+        del T
+
+        #Total part
+        Q = Q_dust + Q_cmb
+        U = U_dust + U_cmb
+        del (Q_cmb,U_cmb,Q_dust,U_dust)
+
+        #beam + noise
+        Tlm, Elm, Blm = hp.map2alm([Q*0,Q,U],lmax=self.lmax)
+        hp.almxfl(Elm,self.beam,inplace=True)
+        hp.almxfl(Blm,self.beam,inplace=True)
+        Elm += hp.synalm(self.Nl,lmax=self.lmax)
+        Blm += hp.synalm(self.Nl,lmax=self.lmax)
+        T,Q,U = hp.alm2map([Tlm,Elm,Blm],self.nside)
+        del (T,Tlm,Elm,Blm)
+
         return np.reshape(np.array((Q,U)),(2,1,self.npix))
 
+    @timing
     def get_sim(self,idx):
-        return self.get_exp_sim(idx) if self.FG else self.make_exp_sim(idx)
+        return self.get_sim_FG(idx) if self.FG else self.get_sim_noFG(idx)
 
+    @timing
     def get_falm_sim(self,idx,filt=''):
         Bl = np.reshape(self.beam,(1,self.lmax+1))
         QU = self.get_sim(idx)
@@ -163,6 +229,7 @@ class RecoBase:
                                      filter=filt,ro=10)
         return E, B
 
+    @timing
     def get_qlm_sim(self,idx):
         fname = os.path.join(self.mass_dir,f"phi_sim_{idx:04d}.pkl")
         if os.path.isfile(fname):
@@ -174,6 +241,11 @@ class RecoBase:
             glm *= self.norm[:,None]
             pl.dump(glm,open(fname,'wb'))
             return glm
+
+    def plot_norm(self):
+        plt.figure(figsize=(8,8))
+        plt.loglog(self.L, self.Lfac*self.norm,)
+        plt.loglog(self.L, self.Lfac*self.cl_unl['pp'][:self.Lmax+1])
 
     def get_qcl_sim(self,idx):
         return cs.utils.alm2cl(self.Lmax,self.get_qlm_sim(idx))

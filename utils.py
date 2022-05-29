@@ -53,3 +53,11 @@ def cli(cl):
     ret = np.zeros_like(cl)
     ret[np.where(cl > 0)] = 1. / cl[np.where(cl > 0)]
     return ret
+
+class Dic2Cls:
+    
+    def __init__(self,dict):
+        self.dict = dict
+    
+    def __getattr__(self,att):
+        return self.dict[att]
